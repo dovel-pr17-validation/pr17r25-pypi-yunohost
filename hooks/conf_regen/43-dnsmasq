@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+#
+# Copyright (c) 2024 YunoHost Contributors
+#
+# This file is part of YunoHost (see https://yunohost.org)
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+
+# Exit hook on subcommand error or unset variable
+set -e
+
+# Source YNH helpers
+# shellcheck source=../../helpers/helpers
+source /usr/share/yunohost/helpers
+
+do_init_regen() {
+
+    cd /usr/share/yunohost/conf/dnsmasq
+
+    if jq -re '.dns_custom_resolvers_enabled' <<< "$YNH_SETTINGS"; then
+        read -ra nameservers <<< "$(jq -r '.dns_custom_resolvers_list' <<< "$YNH_SETTINGS")"
+        for nameserver in "${nameservers[@]}"; do
+            echo "nameserver $nameserver" >> /etc/resolv.dnsmasq.conf
+        done
+    else
+        # Use a seed derived from the machine id and current month
+        # This way, the shuffle is random but should be stable accross the same month
+        # and make sure the regenconf is idempotent (at least during the same month)
+        # i.e. that it doesn't re-shuffle the file everytime we run the regenconf
+        SEED=$( (
+            cat /etc/machine-id || true
+            date +%m%Y
+        ) | md5sum)
+        cat plain/resolv.dnsmasq.conf | grep "^nameserver" | shuf --random-source=<(echo "$SEED") > /etc/resolv.dnsmasq.conf
+    fi
+    chown root /etc/resolv.dnsmasq.conf
+    chmod 644 /etc/resolv.dnsmasq.conf
+
+    cp plain/etcdefault /etc/default/dnsmasq
+
+    export wireless_interfaces=""
+    ynh_render_template "dnsmasq.conf.tpl" "${pending_dir}/etc/dnsmasq.conf"
+
+    # Remove / disable services likely to conflict with dnsmasq
+    for SERVICE in systemd-resolved bind9; do
+        systemctl is-enabled $SERVICE &> /dev/null && systemctl disable $SERVICE 2> /dev/null
+        systemctl is-active $SERVICE &> /dev/null && systemctl stop $SERVICE
+    done
+
+    systemctl restart dnsmasq
+}
+
+do_pre_regen() {
+    pending_dir=$1
+
+    cd /usr/share/yunohost/conf/dnsmasq
+
+    # create directory for pending conf
+    dnsmasq_dir="${pending_dir}/etc/dnsmasq.d"
+    mkdir -p "$dnsmasq_dir"
+    etcdefault_dir="${pending_dir}/etc/default"
+    mkdir -p "$etcdefault_dir"
+
+    # add default conf files
+    cp plain/etcdefault "${pending_dir}/etc/default/dnsmasq"
+
+    # add resolver pool
+    if jq -re '.dns_custom_resolvers_enabled' <<< "$YNH_SETTINGS"; then
+        read -ra nameservers <<< "$(jq -r '.dns_custom_resolvers_list' <<< "$YNH_SETTINGS" | sed 's/,/ /g')"
+        for nameserver in "${nameservers[@]}"; do
+            echo "nameserver $nameserver" >> "${pending_dir}/etc/resolv.dnsmasq.conf"
+        done
+    else
+        # Use a seed derived from the machine id and current month
+        # This way, the shuffle is random but should be stable accross the same month
+        # and make sure the regenconf is idempotent (at least during the same month)
+        # i.e. that it doesn't re-shuffle the file everytime we run the regenconf
+        SEED=$( (
+            cat /etc/machine-id || true
+            date +%m%Y
+        ) | md5sum)
+        cat plain/resolv.dnsmasq.conf | grep "^nameserver" | shuf --random-source=<(echo "$SEED") > "${pending_dir}/etc/resolv.dnsmasq.conf"
+    fi
+
+    # retrieve variables
+    ipv4=$(curl --max-time 10 -s -4 https://ipv4.yunohost.org 2> /dev/null || true)
+    ynh_validate_ip4 "$ipv4" || ipv4='127.0.0.1'
+    ipv6=$(curl --max-time 10 -s -6 https://ipv6.yunohost.org 2> /dev/null || true)
+    ynh_validate_ip6 "$ipv6" || ipv6=''
+    interfaces="$(ip -j addr show | jq -r '[.[].ifname]|join(" ")')"
+    wireless_interfaces="lo"
+    for dev in /sys/class/net/*; do
+        if [ -d "$dev/wireless" ] && grep -q "up" "$dev/operstate"; then
+            wireless_interfaces+=" $(basename "$dev")"
+        fi
+    done
+
+    # General configuration
+    export wireless_interfaces
+    ynh_render_template "dnsmasq.conf.tpl" "${pending_dir}/etc/dnsmasq.conf"
+
+    # add domain conf files
+    export interfaces
+    export ipv4
+    export ipv6
+    for domain in $YNH_DOMAINS; do
+        [[ ! $domain =~ \.local$ ]] || continue
+        export domain
+
+        if tr ' ' '\n' <<< "$YNH_DOMAINS_WITH_MAIL_IN" | grep -q "^$domain$"; then
+            export mail_in="True"
+        else
+            export mail_in="False"
+        fi
+        ynh_render_template "domain.tpl" "${dnsmasq_dir}/${domain}"
+    done
+
+    # We arbitrarily pick 'c' for spamhaus NS but there's a/b/c/e
+    SPAMHAUS_NS=c.gns.spamhaus.org
+    # We need to perform a dig request ... but dnsmasq may not be up yet, and we'll get an empty result
+    # It's not too dramatic because next time the regenconf is ran, dnsmasq should be up
+    # Nevertheless it's good to try to make sure that this doesn't happen to avoid weird stuff where
+    # the regenconf is not idempotent ...
+    # So if dnsmasq is not up, try to pick the first IPv4 resolver from the shuffled list
+    if systemctl --quiet is-active dnsmasq; then
+        RESOLVER_FOR_DIG="127.0.0.1"
+    else
+        RESOLVER_FOR_DIG=$(grep '^nameserver.*\.' /etc/resolv.dnsmasq.conf | head -n1 | awk '{print $2}')
+    fi
+
+    cat << EOF > "${dnsmasq_dir}/spamhaus"
+# Gotta force the usage of resolvers for spamhaus,
+# Which will otherwise complain that we may be using an open resolver...
+# cf https://www.spamhaus.com/resource-center/successfully-accessing-spamhauss-free-block-lists-using-a-public-dns/#yes-but-why-block-queries-from-public-recursive-name-servers
+# We pick one of spamhaus' a/b/c/d/e nameservers, cf https://multirbl.valli.org/detail/zen.spamhaus.org.html
+# And kind of hard-code the corresponding IPs because in practice dnsmasq doesn't allow to have a domain name for the resolver part of server= :| ...
+# Fun-fact : did you know that AAAA is the name of IPv6 DNS records, but also the sound you make when debugging network and DNS??? #TheMoreYouKnow
+EOF
+    for IP in $( (
+        dig +short A $SPAMHAUS_NS "@$RESOLVER_FOR_DIG" 2> /dev/null || true
+        dig +short AAAA $SPAMHAUS_NS "@$RESOLVER_FOR_DIG" 2> /dev/null || true
+    ) | grep -v '^;' | sort); do
+        echo "server=/*.zen.spamhaus.org/$IP" >> "${dnsmasq_dir}/spamhaus"
+    done
+
+    # remove old domain conf files
+    for conf_file in /etc/dnsmasq.d/*.*; do
+        domain=$(basename "$conf_file")
+        if [[ ! $YNH_DOMAINS =~ $domain ]] && [[ ! $domain =~ \.local$ ]] && [[ $domain != spamhaus ]]; then
+            touch "${dnsmasq_dir}/${domain}"
+        fi
+    done
+}
+
+do_post_regen() {
+    regen_conf_files=$1
+
+    # Fuck it, those domain/search entries from dhclient are usually annoying
+    # lying shit from the ISP trying to MiTM
+    if grep -q -E "^ *(domain|search)" /run/resolvconf/resolv.conf; then
+        if grep -q -E "^ *(domain|search)" /run/resolvconf/interface/*.dhclient 2> /dev/null; then
+            sed -E "s/^(domain|search)/#\1/g" -i /run/resolvconf/interface/*.dhclient
+        fi
+
+        grep -q '^supersede domain-name "";' /etc/dhcp/dhclient.conf 2> /dev/null || echo 'supersede domain-name "";' >> /etc/dhcp/dhclient.conf
+        grep -q '^supersede domain-search "";' /etc/dhcp/dhclient.conf 2> /dev/null || echo 'supersede domain-search "";' >> /etc/dhcp/dhclient.conf
+        grep -q '^supersede search "";' /etc/dhcp/dhclient.conf 2> /dev/null || echo 'supersede search "";' >> /etc/dhcp/dhclient.conf
+        systemctl restart resolvconf
+    fi
+
+    # Some stupid things like rabbitmq-server used by onlyoffice won't work if
+    # the *short* hostname doesn't exists in /etc/hosts -_-
+    short_hostname=$(hostname -s)
+    grep -q "127.0.0.1.*$short_hostname" /etc/hosts || echo -e "\n127.0.0.1\t$short_hostname" >> /etc/hosts
+
+    [[ -n "$regen_conf_files" ]] || return 0
+
+    # Force permission (to cover some edge cases where root's umask is like 027 and then dnsmasq cant read this file)
+    chown -R root:root /etc/default/dnsmasq /etc/resolv.dnsmasq.conf /etc/dnsmasq.d/ /etc/dnsmasq.conf
+    chmod -R u=rwX,g=rX,o-w /etc/default/dnsmasq /etc/resolv.dnsmasq.conf /etc/dnsmasq.conf /etc/dnsmasq.d/
+
+    # Remove / disable services likely to conflict with dnsmasq
+    for SERVICE in systemd-resolved bind9; do
+        systemctl is-enabled $SERVICE &> /dev/null && systemctl disable $SERVICE 2> /dev/null
+        systemctl is-active $SERVICE &> /dev/null && systemctl stop $SERVICE
+    done
+
+    systemctl restart dnsmasq
+}
+
+"do_$1_regen" "$(echo "${*:2}" | xargs)"
